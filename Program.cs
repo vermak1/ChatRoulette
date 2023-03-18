@@ -6,20 +6,14 @@ namespace ChatRouletteServer
 {
     internal class Program
     {
-        static async Task Main()
+        static void Main()
         {
-            ServerSocket serverSocket;
-            ClientChatManager manager = null;
+            ServerSocket serverSocket = null;
             try
             {
                 serverSocket = new ServerSocket();
-                manager = new ClientChatManager(serverSocket);
-
-                serverSocket.BindAndStartListen();
-                manager.RunCheckAndMakeChatInCycle();
-                manager.PingTimer(TimeSpan.FromSeconds(60));
-                manager.RunCheckAndMakeChatInCycle();
-                manager.ExceptionHandleCycle();
+                ClientChatManager manager = new ClientChatManager(serverSocket);
+                manager.Start();
             }
             catch (Exception ex)
             {
@@ -28,7 +22,7 @@ namespace ChatRouletteServer
             }
             finally
             {
-                manager?.Dispose();
+                serverSocket?.Dispose();
             }
         }
     }

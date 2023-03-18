@@ -1,29 +1,35 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading.Tasks;
 using System.Threading;
-using System.Runtime.ExceptionServices;
+
 
 namespace ChatRouletteServer
 {
-    internal class ClientChatManager : IDisposable
+    internal class ClientChatManager
     {
         private readonly List<Chat> _chats;
-        private readonly List<ClientInfo> _clientPool;
+        private readonly List<Client> _clientPool;
         private readonly ServerSocket _serverSocket;
-        public readonly static Int32 BUFFER_SIZE = 512;
-        private ExceptionDispatchInfo _dispatchInfo;
 
         public ClientChatManager(ServerSocket socket)
         {
             _chats = new List<Chat>(10);
-            _clientPool = new List<ClientInfo>(20);
+            _clientPool = new List<Client>(20);
             _serverSocket = socket;
         }
 
-        public void WaitingClientAndAddToPoolInCycleAsync()
+        public void Start()
+        {
+            _serverSocket.BindAndStartListen();
+            WaitingClientAndAddToPoolInCycle();
+            RunCheckAndMakeChatInCycle();
+            PingTimer(TimeSpan.FromSeconds(60));
+            Thread.Sleep(Timeout.Infinite);
+        }
+
+        private void WaitingClientAndAddToPoolInCycle()
         {
             ThreadPool.QueueUserWorkItem(async (o) =>
             {
@@ -34,23 +40,25 @@ namespace ChatRouletteServer
                         Console.WriteLine("Waiting for a new client...");
                         Socket clientSocket = await _serverSocket.AcceptAsync();
 
-                        String name = await GetClientNameAsync(clientSocket);
-                        ClientInfo client = new ClientInfo(name, clientSocket);
+                        String name = await MessageReceiver.ReceiveMessageAsync(clientSocket);
+                        Client client = new Client(name, clientSocket);
                         lock (_clientPool)
-                            _clientPool.Add(client);
+                        {
+                            if (!_clientPool.Contains(client))
+                                _clientPool.Add(client);
+                        }
                         Console.WriteLine("User {0} has connected to server and added to pool.", name);
                         await SendWelcomeMessageAsync(client);
                     }
                 }
-                catch (Exception ex) 
+                catch (Exception ex)
                 {
                     Console.WriteLine("Waiting client cycle is failed: {0}", ex.Message);
-                    _dispatchInfo = ExceptionDispatchInfo.Capture(ex);
                 }
             });
         }
 
-        public void RunCheckAndMakeChatInCycle()
+        private void RunCheckAndMakeChatInCycle()
         {
             ThreadPool.QueueUserWorkItem(async (obj) =>
             {
@@ -58,35 +66,45 @@ namespace ChatRouletteServer
                 { 
                     while (true)
                     {
-                        if (_clientPool.Count >= 2)
+                        (Client, Client) clientPair = (null, null);
+                        lock (_clientPool)
                         {
-                            (ClientInfo, ClientInfo) clientPair = _clientPool.ToArray().RandomPair();
-                            if (await CheckClientsBeforeChatStartAsync(clientPair))
+                            if (_clientPool.Count >= 2)
+                                clientPair = _clientPool.RandomPair();
+                            else
                             {
-                                Chat chat = new Chat(clientPair.Item1, clientPair.Item2);
-                                lock (_chats)
-                                    _chats.Add(chat);
-                                lock (_clientPool)
-                                {
-                                    _clientPool.Remove(clientPair.Item1);
-                                    _clientPool.Remove(clientPair.Item2);
-                                }
-                                StartChat(chat);
+                                Thread.Sleep(TimeSpan.FromSeconds(10));
+                                continue;
                             }
                         }
-                        else
-                            Thread.Sleep(TimeSpan.FromSeconds(10));
+
+                        Boolean isClientsReady = false;
+                        if (clientPair.Item1 != null && clientPair.Item2 != null)
+                            isClientsReady = await CheckClientsBeforeChatStartAsync(clientPair);
+
+                        Chat chat = null;
+                        if(isClientsReady)
+                        {
+                            lock (_clientPool)
+                            {
+                                 chat = new Chat(clientPair.Item1, clientPair.Item2);
+                                _clientPool.Remove(clientPair.Item1);
+                                _clientPool.Remove(clientPair.Item2);
+                                lock (_chats)
+                                    _chats.Add(chat);
+                            }
+                            StartChat(chat);
+                        }
                     }
                 }
                 catch(Exception ex) 
                 {
                     Console.WriteLine("Making chat cycle if failed: {0}", ex.Message);
-                    _dispatchInfo = ExceptionDispatchInfo.Capture(ex);
                 }
             });
         }
 
-        public void PingTimer(TimeSpan timeToPing)
+        private void PingTimer(TimeSpan timeToPing)
         {
             ThreadPool.QueueUserWorkItem(async (obj) => 
             {
@@ -105,26 +123,16 @@ namespace ChatRouletteServer
                 catch (Exception ex)
                 {
                     Console.WriteLine("Ping sending failed: {0}", ex.Message);
-                    _dispatchInfo = ExceptionDispatchInfo.Capture(ex);
                 }
             });
         }
 
-        public void ExceptionHandleCycle()
-        {
-            while (true)
-            {
-                if (_dispatchInfo != null)
-                    _dispatchInfo.Throw();
-            }
-        }
-
-        private async Task SendPingAsync(ClientInfo client)
+        private async Task SendPingAsync(Client client)
         {
             try
             {
                 String message = "You are still is in the queue, please wait until someone connects";
-                await SendMessageAsync(client, message);
+                await MessageSender.SendMessageAsync(message, client.ClientSocket);
             }
             catch
             {
@@ -132,16 +140,16 @@ namespace ChatRouletteServer
             }
         }
 
-        private async Task<Boolean> CheckClientsBeforeChatStartAsync((ClientInfo, ClientInfo) pair)
+        private async Task<Boolean> CheckClientsBeforeChatStartAsync((Client, Client) pair)
         {
             return await CheckClientInternalAsync(pair.Item1) && await CheckClientInternalAsync(pair.Item2);
         }
 
-        private async Task<Boolean> CheckClientInternalAsync(ClientInfo client)
+        private async Task<Boolean> CheckClientInternalAsync(Client client)
         {
             try
             {
-                await SendMessageAsync(client, "PingToStartChat");
+                await MessageSender.SendMessageAsync("PingToStartChat", client.ClientSocket);
             }
             catch (SocketException)
             {
@@ -152,36 +160,32 @@ namespace ChatRouletteServer
             return true;
         }
 
-        private void RemoveClientFromPool(ClientInfo client)
+        private void RemoveClientFromPool(Client client)
         {
             lock (_clientPool)
+            {
+                client.Dispose();
                 _clientPool.Remove(client);
+            }
             Console.WriteLine("Client {0} was removed from pool", client.Name);
-        }
-
-        private async Task SendMessageAsync(ClientInfo client, String message)
-        {
-            try
-            {
-                ArraySegment<Byte> buffer = new ArraySegment<Byte>(Encoding.UTF8.GetBytes(message));
-                await client.ClientSocket.SendAsync(buffer, SocketFlags.None);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Sending message [{0}] to client {1} is failed\nError: {2}", message, client.Name, ex.Message);
-                RemoveClientFromPool(client);
-            }
         }
 
         private void StartChat(Chat chat)
         {
             Console.WriteLine("New chat with users [{0}] and [{1}] has been created.", chat.Client1.Name, chat.Client2.Name);
-            ThreadPool.QueueUserWorkItem((obj) =>
+            ThreadPool.QueueUserWorkItem(async (obj) =>
             {
-                ChatContextHolder chatContext = new ChatContextHolder(chat);
-                chatContext.SendChatStartedMessage();
-                chatContext.ListenAndResend();
-                chatContext.Disconnected += HandleDisconnectEvent;
+                try
+                {
+                    ChatContextHolder chatContext = new ChatContextHolder(chat);
+                    await chatContext.RunChat();
+                    chatContext.Disconnected += HandleDisconnectEvent;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Chat with clients {0} and {1} has been destroyed\nError: {2}", chat.Client1.Name, chat.Client2.Name, ex.Message);
+                }
+
             });
         }
 
@@ -201,39 +205,27 @@ namespace ChatRouletteServer
                 _chats.Remove(eventArgs.Chat);
         }
 
-        private async Task ReturnClientToPool(ClientInfo client)
+        private async Task ReturnClientToPool(Client client)
         {
             Console.WriteLine("Client {0} will be returned to the pool", client.Name);
             lock (_clientPool)
                 _clientPool.Add(client);
+
             String message = "Your interlocutor has been disconnected, you'll return back to queue";
-            await SendMessageAsync(client, message);
+            await MessageSender.SendMessageAsync(message, client.ClientSocket);
         }
 
-        private async Task SendWelcomeMessageAsync(ClientInfo client)
+        private async Task SendWelcomeMessageAsync(Client client)
         {
             try
             {
                 String s = "Welcome to chat roulette, you are in queue for chatting...";
-                await SendMessageAsync(client, s);
+                await MessageSender.SendMessageAsync(s, client.ClientSocket);
             }
             catch
             {
                 throw;
             }
-        }
-
-        private async Task<String> GetClientNameAsync(Socket clientSocket)
-        {
-            Byte[] buffer = new Byte[BUFFER_SIZE];
-            ArraySegment<Byte> bufferArr = new ArraySegment<Byte>(buffer);
-            Int32 bytes = await clientSocket.ReceiveAsync(bufferArr, 0);
-            return Encoding.UTF8.GetString(bufferArr.Array, 0, bytes);
-        }
-
-        public void Dispose()
-        {
-            _serverSocket?.Dispose();
         }
     }
 }
